@@ -280,23 +280,6 @@ def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int,
 
 # --------------------- helpers ---------------------
 
-def _append_metrics_to_json(path: str, entry: dict):
-    """Append `entry` to a JSON array file at `path` (create if needed)."""
-    try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                data = [data]
-        else:
-            data = []
-    except Exception:
-        data = []
-    data.append(entry)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
 # --------------------- answer extraction ---------------------
 
 def extract_frontierscience_answer(response: str) -> Optional[str]:
@@ -578,6 +561,9 @@ def load_frontierscience(domain: Optional[str] = None, sample_range: Optional[st
             "original_idx": i,
         })
 
+    # Filter to olympiad questions only (exclude research questions whose answers start with "Points")
+    data = [d for d in data if not d["answer"].startswith("Points")]
+
     # Filter by domain if specified
     if domain:
         domain_lower = domain.lower()
@@ -836,7 +822,6 @@ def loop(
     # Build output paths with optional run_name suffix
     run_suffix = f"_{run_name}" if run_name else ""
     os.makedirs(output_dir, exist_ok=True)
-    metrics_path = os.path.join(output_dir, f'k_{k}_N_{population}{run_suffix}.json')
     rollouts_path = os.path.join(output_dir, f'rollouts_k_{k}_N_{population}{run_suffix}.jsonl')
     print(f"Rollout logs will be saved to: {rollouts_path}")
 
@@ -885,33 +870,6 @@ def loop(
         )
 
         print(f"Loop {loop_idx} metrics: {metrics}")
-        metrics_dict = json.loads(metrics)
-
-        out_entry = {
-            "n_samples": metrics_dict.get("n_samples", None),
-            "k": k,
-            "population": population,
-            "loop": loop_idx,
-            "task": task,
-            "domain": domain,
-            "mean_acc_k": metrics_dict["mean_acc_k"],
-            "mean_pass_at_k": metrics_dict["mean_pass_at_k"],
-            "mean_majority_acc": metrics_dict["mean_majority_acc"],
-            "mean_length": metrics_dict["mean_length"],
-            "median_length": metrics_dict["median_length"],
-            "q25_length": metrics_dict["q25_length"],
-            "q75_length": metrics_dict["q75_length"],
-        }
-
-        _append_metrics_to_json(metrics_path, out_entry)
-        print(f"Appended metrics for loop {loop_idx} to {metrics_path}")
-
-    # Save question IDs for reproducibility
-    question_ids = [d['task_group_id'] for d in data]
-    ids_path = os.path.join(output_dir, f'question_ids_k_{k}_N_{population}{run_suffix}.json')
-    with open(ids_path, 'w') as f:
-        json.dump({"question_ids": question_ids, "domain": domain, "n_samples": len(data)}, f, indent=2)
-    print(f"Saved question IDs to {ids_path}")
 
 
 def main():
