@@ -186,11 +186,33 @@ def load_api_keys(key_file: str = "api_key.txt") -> Dict[str, str]:
     return keys
 
 
-def get_api_client(model: str, openai_api_key: Optional[str] = None, anthropic_api_key: Optional[str] = None):
-    """Return appropriate client based on model name."""
+# LIVAI API configuration
+LIVAI_API_BASE = "https://livai-api.llnl.gov/v1"
+
+
+def get_api_client(
+    model: str,
+    openai_api_key: Optional[str] = None,
+    anthropic_api_key: Optional[str] = None,
+    livai_api_key: Optional[str] = None,
+):
+    """Return appropriate client based on model name and available API keys.
+
+    Priority for Claude models:
+    1. LIVAI API (if LIVAI_API_KEY is set) - uses OpenAI-compatible endpoint
+    2. Anthropic API (fallback)
+
+    For non-Claude models, uses OpenAI API.
+    """
     if model.startswith("claude"):
-        import anthropic
-        return anthropic.Anthropic(api_key=anthropic_api_key), "anthropic"
+        # Prefer LIVAI for Claude models if key is available
+        if livai_api_key:
+            import openai
+            client = openai.OpenAI(api_key=livai_api_key, base_url=LIVAI_API_BASE)
+            return client, "livai"
+        else:
+            import anthropic
+            return anthropic.Anthropic(api_key=anthropic_api_key), "anthropic"
     else:
         import openai
         return openai.OpenAI(api_key=openai_api_key), "openai"
@@ -203,7 +225,13 @@ def get_grader_client(openai_api_key: Optional[str] = None):
 
 
 def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int, temperature: float, retries: int = 3) -> str:
-    """Call API and return response text with retry logic."""
+    """Call API and return response text with retry logic.
+
+    Supports three client types:
+    - "anthropic": Native Anthropic API
+    - "openai": OpenAI API
+    - "livai": LIVAI API (OpenAI-compatible endpoint for Claude models)
+    """
     for attempt in range(retries):
         try:
             if client_type == "anthropic":
@@ -215,6 +243,7 @@ def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int,
                 )
                 return response.content[0].text
             else:
+                # Both "openai" and "livai" use OpenAI SDK (livai has custom base_url)
                 response = client.chat.completions.create(
                     model=model,
                     max_tokens=max_tokens,
@@ -757,6 +786,7 @@ def loop(
     temperature: float,
     openai_api_key: Optional[str],
     anthropic_api_key: Optional[str],
+    livai_api_key: Optional[str],
     max_workers: int,
     run_name: str = "",
     verbose: bool = False,
@@ -767,10 +797,14 @@ def loop(
         logger.warn_no_rich()
 
     # Setup API clients
-    client, client_type = get_api_client(model_name, openai_api_key, anthropic_api_key)
+    client, client_type = get_api_client(model_name, openai_api_key, anthropic_api_key, livai_api_key)
     grader_client = get_grader_client(openai_api_key)
-    print(f"Using model: {model_name} ({client_type})")
-    print(f"Using {GRADER_MODEL} as grader")
+
+    if client_type == "livai":
+        print(f"Using model: {model_name} via LIVAI API")
+    else:
+        print(f"Using model: {model_name} ({client_type})")
+    print(f"Using {GRADER_MODEL} as grader (OpenAI)")
 
     # Load dataset
     print("Loading FrontierScience dataset...")
@@ -887,6 +921,7 @@ def main():
     file_keys = load_api_keys()
     openai_key = args.openai_api_key or file_keys.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
     anthropic_key = args.anthropic_api_key or file_keys.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    livai_key = file_keys.get("LIVAI_API_KEY") or os.environ.get("LIVAI_API_KEY")
 
     loop(
         model_name=args.model,
@@ -900,6 +935,7 @@ def main():
         temperature=args.temperature,
         openai_api_key=openai_key,
         anthropic_api_key=anthropic_key,
+        livai_api_key=livai_key,
         max_workers=args.max_workers,
         run_name=args.run_name,
         verbose=args.verbose,
