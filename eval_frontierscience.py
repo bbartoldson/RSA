@@ -224,6 +224,12 @@ def get_grader_client(openai_api_key: Optional[str] = None):
     return openai.OpenAI(api_key=openai_api_key)
 
 
+def is_rate_limit_error(e: Exception) -> bool:
+    """Check if an exception is a rate limit error (HTTP 429)."""
+    error_str = str(e).lower()
+    return "429" in error_str or "rate" in error_str or "throttl" in error_str or "too many" in error_str
+
+
 def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int, temperature: float, retries: int = 3) -> str:
     """Call API and return response text with retry logic.
 
@@ -231,8 +237,12 @@ def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int,
     - "anthropic": Native Anthropic API
     - "openai": OpenAI API
     - "livai": LIVAI API (OpenAI-compatible endpoint for Claude models)
+
+    Rate limit errors (429) are retried indefinitely with 60s wait.
+    Other errors are retried up to `retries` times with exponential backoff.
     """
-    for attempt in range(retries):
+    attempt = 0
+    while True:
         try:
             if client_type == "anthropic":
                 response = client.messages.create(
@@ -252,10 +262,18 @@ def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int,
                 )
                 return response.choices[0].message.content
         except Exception as e:
-            if attempt < retries - 1:
+            if is_rate_limit_error(e):
+                # Rate limit: wait 60s and retry indefinitely
+                wait = 60
+                print(f"Rate limit hit: {e}. Waiting {wait}s before retrying...")
+                time.sleep(wait)
+                # Don't increment attempt for rate limits - retry forever
+            elif attempt < retries - 1:
+                # Other errors: exponential backoff with limited retries
                 wait = 2 ** attempt
                 print(f"API error: {e}. Retrying in {wait}s...")
                 time.sleep(wait)
+                attempt += 1
             else:
                 raise
 
@@ -906,10 +924,10 @@ def main():
     ap.add_argument("--k", type=int, default=4, help="Candidates to sample for aggregation")
     ap.add_argument("--population", type=int, default=16, help="Candidates per problem per loop")
     ap.add_argument("--loops", type=int, default=10, help="Number of RSA loops")
-    ap.add_argument("--max-tokens", type=int, default=4096, help="Max tokens per response")
-    ap.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    ap.add_argument("--max-tokens", type=int, default=16384, help="Max tokens per response")
+    ap.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     ap.add_argument("--run-name", type=str, default="", help="Optional run name suffix for output files")
-    ap.add_argument("--max-workers", type=int, default=32, help="Max parallel API calls")
+    ap.add_argument("--max-workers", type=int, default=4, help="Max parallel API calls")
     ap.add_argument("--verbose", "-v", action='store_true', help="Show live extracted answers and scores (requires 'rich')")
 
     # API keys (default to env vars via api_key.txt)
