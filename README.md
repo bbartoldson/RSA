@@ -37,6 +37,42 @@ python eval_code.py \
   --population 16
 ```
 
+### FrontierScience (API-based models)
+
+For **FrontierScience** evaluation with API-based models (OpenAI, Anthropic), use `eval_frontierscience.py`. Uses GPT 5.2 as grader.
+
+1) Baseline run (no RSA) with `gpt-4o`, population size `N=16`:
+```bash
+python eval_frontierscience.py \
+  --model gpt-4o \
+  --output ./eval/frontierscience \
+  --population 16 \
+  --no-rsa
+```
+
+2) RSA run with `gpt-4o`, aggregation size `K=4`, population size `N=16`, sequential steps `T=10`:
+```bash
+python eval_frontierscience.py \
+  --model gpt-4o \
+  --output ./eval/frontierscience \
+  --k 4 \
+  --population 16 \
+  --loops 10
+```
+
+Filter by domain (`bio`, `physics`, `chem`) or limit samples:
+```bash
+python eval_frontierscience.py \
+  --model claude-sonnet-4-20250514 \
+  --domain physics \
+  --n-samples 20 \
+  --k 4 \
+  --population 16 \
+  --loops 10
+```
+
+Results are saved to `./eval/frontierscience/<run_id>.json` with `question_ids` for reproducibility.
+
 ## Aggregation-aware RL training with verl
 
 First install verl from `https://github.com/volcengine/verl.git`.

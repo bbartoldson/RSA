@@ -3,7 +3,7 @@ Evaluate API-based models on FrontierScience benchmark using RSA aggregation.
 Adapted from eval_loop.py with minimal changes for API-based inference.
 
 Usage:
-    python eval_frontierscience_v3.py \
+    python eval_frontierscience.py \
         --model claude-3-5-haiku-20241022 \
         --domain bio \
         --n-samples 10 \
@@ -13,11 +13,13 @@ Usage:
 """
 
 from typing import List, Dict, Any, Optional, Callable
+from dataclasses import dataclass, asdict
 import argparse
 import json
 import os
 import re
 import random
+import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +27,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
-import pickle
 
 # Optional rich library for verbose output
 try:
@@ -38,6 +39,54 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
+
+
+# --------------------- rollout record ---------------------
+
+@dataclass
+class RolloutRecord:
+    """Record for a single rollout (generation) for failure mode analysis."""
+    rollout_uid: str          # "{problem_idx}_{loop}_{rollout_idx}"
+    problem_idx: int
+    loop: int
+    rollout_idx: int
+    domain: str               # bio/physics/chem
+    is_rsa: bool              # True if aggregation (loop > 0), False if baseline (loop 0)
+    parent_uids: List[str]    # UIDs of candidates used in aggregation (empty if loop 0)
+    generation: str           # Full response text
+    extracted_answer: str     # Extracted answer
+    ground_truth: str         # Target/GT answer
+    grade: float              # -1 (failed) / 0 (incorrect) / 1 (correct)
+    grader_reasoning: str     # GPT 5.2 reasoning (empty if grade=-1)
+
+
+def write_rollout_to_jsonl(rollout: RolloutRecord, path: str) -> None:
+    """Append a single rollout record to a JSONL file."""
+    with open(path, "a") as f:
+        f.write(json.dumps(asdict(rollout)) + "\n")
+
+
+def load_existing_problem_indices(rollouts_path: str) -> set:
+    """Load problem indices from existing rollouts file."""
+    if not os.path.exists(rollouts_path):
+        return set()
+
+    indices = set()
+    with open(rollouts_path, "r") as f:
+        for line in f:
+            if line.strip():
+                record = json.loads(line)
+                indices.add(record["problem_idx"])
+    return indices
+
+
+def check_problem_collision(rollouts_path: str, new_indices: List[int]) -> List[int]:
+    """Check if any new problem indices already exist in rollouts file.
+
+    Returns list of colliding indices (empty if no collision).
+    """
+    existing = load_existing_problem_indices(rollouts_path)
+    return sorted(set(new_indices) & existing)
 
 
 # --------------------- verbose logging ---------------------
@@ -183,31 +232,6 @@ def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int,
 
 
 # --------------------- helpers ---------------------
-
-def load_latest_loop_file(dir_path):
-    dir_path = Path(dir_path)
-    pattern = re.compile(r"loop_(\d+)\.pkl$")
-
-    max_i = -1
-    latest_file = None
-
-    for file in dir_path.iterdir():
-        if file.is_file():
-            match = pattern.match(file.name)
-            if match:
-                i = int(match.group(1))
-                if i > max_i:
-                    max_i = i
-                    latest_file = file
-
-    if latest_file is None:
-        raise FileNotFoundError("No loop_{i}.pkl files found in directory")
-
-    with open(latest_file, "rb") as f:
-        data = pickle.load(f)
-
-    return data, max_i, latest_file
-
 
 def _append_metrics_to_json(path: str, entry: dict):
     """Append `entry` to a JSON array file at `path` (create if needed)."""
@@ -384,8 +408,14 @@ First, think step-by-step about whether the attempted answer matches the referen
 """
 
 
-def score_with_llm(grader_client, problem: str, prediction: str, ground_truth: str) -> float:
-    """Score a prediction using GPT 5.2 as grader. Returns 1.0 or 0.0."""
+def score_with_llm(grader_client, problem: str, prediction: str, ground_truth: str) -> tuple[float, str]:
+    """Score a prediction using GPT 5.2 as grader.
+
+    Returns:
+        (score, reasoning) tuple where:
+        - score is 1.0 (correct), 0.0 (incorrect), or -1.0 (grading failed)
+        - reasoning is the grader's full response text, or empty string if grading failed
+    """
     prompt = GRADER_PROMPT.format(
         problem=problem,
         ground_truth=ground_truth,
@@ -399,19 +429,19 @@ def score_with_llm(grader_client, problem: str, prediction: str, ground_truth: s
                 input=prompt,
                 reasoning={"effort": "high"}
             )
-            verdict = response.output_text.strip()
+            reasoning = response.output_text.strip()
             # Parse "VERDICT: CORRECT" or "VERDICT: INCORRECT"
-            if "VERDICT: CORRECT" in verdict.upper():
-                return 1.0
-            else:
-                return 0.0
+            if "VERDICT: CORRECT" in reasoning.upper():
+                return (1.0, reasoning)
+            elif "VERDICT: INCORRECT" in reasoning.upper():
+                return (0.0, reasoning)
         except Exception as e:
             if attempt < 2:
                 time.sleep(2 ** attempt)
             else:
-                print(f"Grading failed: {e}, defaulting to 0.0")
-                return 0.0
-    return 0.0
+                print(f"Grading failed: {e}, returning -1.0")
+                return (-1.0, "")
+    return (-1.0, "")
 
 
 def evaluate_k_answers_frontierscience(
@@ -432,32 +462,23 @@ def evaluate_k_answers_frontierscience(
     # Grade only the extracted answers (parallel)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(score_with_llm, grader_client, problem, e, gt) for e in extracted]
-        scores = [f.result() for f in futures]
+        results = [f.result() for f in futures]
 
-    mean_acc = float(sum(scores) / max(1, len(scores)))
-    pass_at_k = float(1.0 if any(s >= 1.0 for s in scores) else 0.0)
+    # Unpack (score, reasoning) tuples
+    scores = [r[0] for r in results]
+    grader_reasonings = [r[1] for r in results]
 
-    # Majority vote (simple: most common extracted answer)
-    clusters: List[Dict[str, Any]] = []
-    for e, s in zip(extracted, scores):
-        placed = False
-        for c in clusters:
-            if e == c["rep"]:  # Exact string match for simplicity
-                c["count"] += 1
-                c["score"] = max(c["score"], s)  # Track if any in cluster is correct
-                placed = True
-                break
-        if not placed:
-            clusters.append({"rep": e, "count": 1, "score": s})
+    # For metrics, exclude grading failures (-1.0)
+    valid_scores = [s for s in scores if s >= 0.0]
+    mean_acc = float(sum(valid_scores) / max(1, len(valid_scores))) if valid_scores else 0.0
+    pass_at_k = float(1.0 if any(s >= 1.0 for s in valid_scores) else 0.0)
 
-    if clusters:
-        best = max(clusters, key=lambda c: c["count"])
-        majority_vote = float(best["score"])
-    else:
-        majority_vote = 0.0
+    # Majority vote: correct if more than half of valid answers are correct
+    majority_vote = 1.0 if valid_scores and (sum(valid_scores) / len(valid_scores)) >= 0.5 else 0.0
 
     return {
         "pred_accuracies": [float(s) for s in scores],
+        "grader_reasonings": grader_reasonings,
         "extracted_answers": extracted,
         "mean_acc": mean_acc,
         "pass_at_k": pass_at_k,
@@ -491,13 +512,12 @@ def parse_sample_range(sample_spec: Optional[str]) -> tuple:
         return (0, int(sample_spec))
 
 
-def load_frontierscience(domain: Optional[str] = None, sample_range: Optional[str] = None, seed: int = 1234) -> List[Dict]:
+def load_frontierscience(domain: Optional[str] = None, sample_range: Optional[str] = None) -> List[Dict]:
     """Load FrontierScience dataset with optional filtering.
 
     Args:
         domain: Filter to specific domain (bio, physics, chem)
         sample_range: Sample specification - int for first N, or 'start:end' for range (0-indexed)
-        seed: Random seed (for reproducibility tracking)
     """
     ds = load_dataset("openai/frontierscience", split="test")
 
@@ -534,6 +554,20 @@ def generate_candidates(A, M, R):
     return [random.sample(A, R) for _ in range(M)]
 
 
+def generate_candidates_with_indices(A, M, R):
+    """Sample R indices from pool A to create M aggregation batches.
+
+    Returns:
+        List of (indices, candidates) tuples. Indices are positions in A,
+        candidates are the actual values at those positions.
+        Returns [(None, None), ...] if A is None (loop 0).
+    """
+    if A is None:
+        return [(None, None) for _ in range(M)]
+    indices_list = [random.sample(range(len(A)), R) for _ in range(M)]
+    return [(idx_list, [A[i] for i in idx_list]) for idx_list in indices_list]
+
+
 def reshape_list(lst, K):
     return [lst[i:i+K] for i in range(0, len(lst), K)]
 
@@ -554,29 +588,35 @@ def run(
     loop_idx: int = 0,
     output_dir: Optional[str] = None,
     loops: int = 1,
+    rollouts_path: Optional[str] = None,
 ) -> tuple:
     """Run one loop of generation + evaluation."""
     if logger:
         logger.loop_header(loop_idx, len(data), population)
 
-    # Build all prompts
+    # Build all prompts with rollout tracking
     requests = []
+    # Track: (problem_idx, rollout_idx, parent_indices) for each request
+    request_metadata = []
     # Store one example for visualization (first problem, first aggregation)
     agg_example_candidates = None
     agg_example_question = None
 
-    for problem in data:
+    for problem_idx, problem in enumerate(data):
         prompt_text = problem['orig_prompt']
-        candidate_answers = generate_candidates(problem['candidates'], population, k)
+
+        # Use generate_candidates_with_indices to track parents
+        candidates_with_indices = generate_candidates_with_indices(problem['candidates'], population, k)
 
         # Capture first aggregation example for visualization
-        if agg_example_candidates is None and candidate_answers[0] is not None:
-            agg_example_candidates = candidate_answers[0]
+        if agg_example_candidates is None and candidates_with_indices[0][1] is not None:
+            agg_example_candidates = candidates_with_indices[0][1]
             agg_example_question = prompt_text
 
-        for candidates in candidate_answers:
+        for rollout_idx, (parent_indices, candidates) in enumerate(candidates_with_indices):
             request = build_prompt(prompt_text, candidates, task, loops-loop_idx-1)
             requests.append((problem, request))
+            request_metadata.append((problem_idx, rollout_idx, parent_indices))
 
     # Generate responses in parallel
     print(f"Generating {len(requests)} responses...")
@@ -601,11 +641,16 @@ def run(
     q75 = np.percentile(response_lengths, 75)
     mean_response_length = sum(response_lengths) / max(1, len(response_lengths))
 
-    # Reshape responses back to per-problem
+    # Reshape responses and metadata back to per-problem
     all_responses = reshape_list(all_responses, population)
+    all_metadata = reshape_list(request_metadata, population)
 
+    # Store candidates and rollout UIDs for next loop
     for problem, responses in zip(data, all_responses):
         problem['candidates'] = responses
+        # Store rollout UIDs for this loop's responses (used as parent_uids in next loop)
+        original_idx = problem['original_idx']
+        problem['rollout_uids'] = [f"{original_idx}_{loop_idx}_{i}" for i in range(len(responses))]
 
     # Visualize one aggregation example (if this is an aggregation loop)
     if agg_example_candidates is not None and output_dir:
@@ -626,11 +671,15 @@ def run(
 
     print("Evaluating...")
     use_tqdm = not (logger and logger.enabled)  # Don't use tqdm if verbose logging
-    iterator = tqdm(enumerate(zip(data, all_responses)), total=len(data), desc="Grading") if use_tqdm else enumerate(zip(data, all_responses))
+    iterator = tqdm(enumerate(zip(data, all_responses, all_metadata)), total=len(data), desc="Grading") if use_tqdm else enumerate(zip(data, all_responses, all_metadata))
 
-    for idx, (problem, responses) in iterator:
+    for idx, (problem, responses, metadata_list) in iterator:
         gt = problem['gt']
         orig_prompt = problem['orig_prompt']
+        domain = problem.get('subject', 'unknown').lower()
+        original_idx = problem['original_idx']
+        # Get parent rollout_uids from previous loop (if any)
+        prev_rollout_uids = problem.get('prev_rollout_uids', [])
 
         perf_metric = evaluate_k_answers_frontierscience(
             grader_client, orig_prompt, responses[:], gt
@@ -638,14 +687,44 @@ def run(
         # Save extracted answers and scores for debugging/reproducibility
         problem['extracted_answers'] = perf_metric['extracted_answers']
         problem['scores'] = perf_metric['pred_accuracies']
+        problem['grader_reasonings'] = perf_metric['grader_reasonings']
 
         mean_acc_list.append(perf_metric['mean_acc'])
         pass_at_k_list.append(perf_metric['pass_at_k'])
         majority_acc_list.append(perf_metric['majority_vote_correct'])
 
+        # Write rollout records to JSONL
+        if rollouts_path:
+            for rollout_idx, (_, _, parent_indices) in enumerate(metadata_list):
+                # Compute parent_uids from indices
+                if parent_indices is not None and prev_rollout_uids:
+                    parent_uids = [prev_rollout_uids[i] for i in parent_indices]
+                else:
+                    parent_uids = []
+
+                rollout = RolloutRecord(
+                    rollout_uid=f"{original_idx}_{loop_idx}_{rollout_idx}",
+                    problem_idx=original_idx,
+                    loop=loop_idx,
+                    rollout_idx=rollout_idx,
+                    domain=domain,
+                    is_rsa=(loop_idx > 0),
+                    parent_uids=parent_uids,
+                    generation=responses[rollout_idx],
+                    extracted_answer=perf_metric['extracted_answers'][rollout_idx],
+                    ground_truth=gt,
+                    grade=perf_metric['pred_accuracies'][rollout_idx],
+                    grader_reasoning=perf_metric['grader_reasonings'][rollout_idx],
+                )
+                write_rollout_to_jsonl(rollout, rollouts_path)
+
         # Verbose logging: show extracted answers and scores
         if logger:
             logger.show_problem(idx, problem, perf_metric['extracted_answers'], perf_metric['pred_accuracies'])
+
+    # Store current rollout_uids as prev_rollout_uids for next loop
+    for problem in data:
+        problem['prev_rollout_uids'] = problem.get('rollout_uids', [])
 
     metrics_dict = {
         "n_samples": len(mean_acc_list),
@@ -676,11 +755,10 @@ def loop(
     output_dir: str,
     max_tokens: int,
     temperature: float,
-    seed: int,
-    resume: bool,
     openai_api_key: Optional[str],
     anthropic_api_key: Optional[str],
     max_workers: int,
+    run_name: str = "",
     verbose: bool = False,
 ):
     # Setup verbose logger
@@ -696,56 +774,43 @@ def loop(
 
     # Load dataset
     print("Loading FrontierScience dataset...")
-    ds = load_frontierscience(domain=domain, sample_range=sample_range, seed=seed)
+    ds = load_frontierscience(domain=domain, sample_range=sample_range)
     range_info = f" (samples {sample_range})" if sample_range else ""
     domain_info = f" (domain={domain})" if domain else ""
     print(f"Loaded {len(ds)} samples{domain_info}{range_info}")
 
     task = "frontierscience"
 
-    # Control RNG for candidate sampling
-    random.seed(seed)
-    np.random.seed(seed)
-
+    # Build output paths with optional run_name suffix
+    run_suffix = f"_{run_name}" if run_name else ""
     os.makedirs(output_dir, exist_ok=True)
-    metrics_path = os.path.join(output_dir, f'k_{k}_N_{population}_seed_{seed}.json')
-    if not resume:
-        if os.path.exists(metrics_path):
-            os.remove(metrics_path)
-    checkpoints_path = os.path.join(output_dir, f'checkpoints/k_{k}_N_{population}_seed_{seed}')
-    os.makedirs(checkpoints_path, exist_ok=True)
+    metrics_path = os.path.join(output_dir, f'k_{k}_N_{population}{run_suffix}.json')
+    rollouts_path = os.path.join(output_dir, f'rollouts_k_{k}_N_{population}{run_suffix}.jsonl')
+    print(f"Rollout logs will be saved to: {rollouts_path}")
 
-    if resume:
-        try:
-            data, start_loop_idx, _ = load_latest_loop_file(checkpoints_path)
-            print(f'Resuming from loop: {start_loop_idx + 1}')
-        except FileNotFoundError:
-            print('Checkpoint not found; starting fresh')
-            data = [
-                {
-                    'orig_prompt': row['problem'],
-                    'subject': row['subject'],
-                    'task_group_id': row['task_group_id'],
-                    'gt': row['answer'],
-                    'candidates': None,
-                }
-                for row in ds
-            ]
-            start_loop_idx = -1
-    else:
-        data = [
-            {
-                'orig_prompt': row['problem'],
-                'subject': row['subject'],
-                'task_group_id': row['task_group_id'],
-                'gt': row['answer'],
-                'candidates': None,
-            }
-            for row in ds
-        ]
-        start_loop_idx = -1
+    # Check for collision with existing rollouts
+    new_problem_indices = [row['original_idx'] for row in ds]
+    collisions = check_problem_collision(rollouts_path, new_problem_indices)
+    if collisions:
+        print(f"\nERROR: Problem indices {collisions} have already been evaluated.")
+        print(f"These exist in: {rollouts_path}")
+        print("Please use a different --run-name or --n-samples range to avoid overlap.")
+        sys.exit(1)
 
-    for loop_idx in range(start_loop_idx + 1, loops):
+    # Initialize data with original_idx for tracking
+    data = [
+        {
+            'orig_prompt': row['problem'],
+            'subject': row['subject'],
+            'task_group_id': row['task_group_id'],
+            'gt': row['answer'],
+            'original_idx': row['original_idx'],
+            'candidates': None,
+        }
+        for row in ds
+    ]
+
+    for loop_idx in range(loops):
         if not (logger and logger.enabled):
             print(f"\n=== Loop {loop_idx} ===")
         data, metrics = run(
@@ -763,12 +828,9 @@ def loop(
             logger=logger,
             loop_idx=loop_idx,
             output_dir=output_dir,
-            loops=loops
+            loops=loops,
+            rollouts_path=rollouts_path,
         )
-
-        # Save checkpoint
-        with open(os.path.join(checkpoints_path, f'loop_{loop_idx}.pkl'), 'wb') as file:
-            pickle.dump(data, file)
 
         print(f"Loop {loop_idx} metrics: {metrics}")
         metrics_dict = json.loads(metrics)
@@ -794,7 +856,7 @@ def loop(
 
     # Save question IDs for reproducibility
     question_ids = [d['task_group_id'] for d in data]
-    ids_path = os.path.join(output_dir, f'question_ids_k_{k}_N_{population}_seed_{seed}.json')
+    ids_path = os.path.join(output_dir, f'question_ids_k_{k}_N_{population}{run_suffix}.json')
     with open(ids_path, 'w') as f:
         json.dump({"question_ids": question_ids, "domain": domain, "n_samples": len(data)}, f, indent=2)
     print(f"Saved question IDs to {ids_path}")
@@ -812,8 +874,7 @@ def main():
     ap.add_argument("--loops", type=int, default=10, help="Number of RSA loops")
     ap.add_argument("--max-tokens", type=int, default=4096, help="Max tokens per response")
     ap.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    ap.add_argument("--seed", type=int, default=1234, help="Random seed")
-    ap.add_argument("--resume", action='store_true', default=False, help="Resume from checkpoint")
+    ap.add_argument("--run-name", type=str, default="", help="Optional run name suffix for output files")
     ap.add_argument("--max-workers", type=int, default=32, help="Max parallel API calls")
     ap.add_argument("--verbose", "-v", action='store_true', help="Show live extracted answers and scores (requires 'rich')")
 
@@ -837,11 +898,10 @@ def main():
         output_dir=os.path.join(args.output, args.model.replace('/', '_')),
         max_tokens=args.max_tokens,
         temperature=args.temperature,
-        seed=args.seed,
-        resume=args.resume,
         openai_api_key=openai_key,
         anthropic_api_key=anthropic_key,
         max_workers=args.max_workers,
+        run_name=args.run_name,
         verbose=args.verbose,
     )
 
