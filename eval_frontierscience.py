@@ -218,10 +218,11 @@ def get_api_client(
         return openai.OpenAI(api_key=openai_api_key), "openai"
 
 
-def get_grader_client(openai_api_key: Optional[str] = None):
-    """Return OpenAI client for grading (always uses OpenAI for GPT 5.2)."""
-    import openai
-    return openai.OpenAI(api_key=openai_api_key)
+from judge_utils import (
+    GRADER_MODEL, GEMINI_GRADER_MODEL,
+    get_grader_client, get_gemini_grader_client,
+    score_with_llm, score_with_gemini, score_with_debate,
+)
 
 
 def is_rate_limit_error(e: Exception) -> bool:
@@ -230,13 +231,25 @@ def is_rate_limit_error(e: Exception) -> bool:
     return "429" in error_str or "rate" in error_str or "throttl" in error_str or "too many" in error_str
 
 
-def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int, temperature: float, retries: int = 3) -> str:
+def _is_new_claude(model: str) -> bool:
+    """Check if model is Claude 4.6+ (supports adaptive thinking)."""
+    return bool(re.search(r'4[._-]6', model))
+
+
+
+def call_api(client, client_type: str, model: str, prompt: str, temperature: float, thinking_budget: int = 16384, retries: int = 3) -> str:
     """Call API and return response text with retry logic.
 
     Supports three client types:
-    - "anthropic": Native Anthropic API
-    - "openai": OpenAI API
+    - "anthropic": Native Anthropic API (with thinking enabled)
+    - "openai": OpenAI API (reasoning_effort=high, no token cap)
     - "livai": LIVAI API (OpenAI-compatible endpoint for Claude models)
+
+    For Anthropic models:
+    - Claude 4.6+: adaptive thinking with high effort
+    - Older Claude: extended thinking with explicit budget (thinking_budget)
+
+    For OpenAI / LIVAI: reasoning_effort="high", no max_completion_tokens cap.
 
     Rate limit errors (429) are retried indefinitely with 60s wait.
     Other errors are retried up to `retries` times with exponential backoff.
@@ -245,19 +258,34 @@ def call_api(client, client_type: str, model: str, prompt: str, max_tokens: int,
     while True:
         try:
             if client_type == "anthropic":
-                response = client.messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                return response.content[0].text
+                kwargs = {
+                    "model": model,
+                    "max_tokens": 64000,
+                    "temperature": temperature,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                if _is_new_claude(model):
+                    kwargs["thinking"] = {"type": "adaptive"}
+                    kwargs["output_config"] = {"effort": "high"}
+                else:
+                    kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+                with client.messages.stream(**kwargs) as stream:
+                    response = stream.get_final_message()
+                # With thinking enabled, extract the text block (skip thinking blocks)
+                for block in response.content:
+                    if getattr(block, 'type', None) == "text" and hasattr(block, 'text'):
+                        return block.text
+                # Fallback: return first block that has a text attribute
+                for block in response.content:
+                    if hasattr(block, 'text'):
+                        return block.text
+                raise ValueError(f"No text content in Anthropic response: {[getattr(b, 'type', '?') for b in response.content]}")
             else:
                 # Both "openai" and "livai" use OpenAI SDK (livai has custom base_url)
                 response = client.chat.completions.create(
                     model=model,
-                    max_tokens=max_tokens,
                     temperature=temperature,
+                    reasoning_effort="high",
                     messages=[{"role": "user", "content": prompt}]
                 )
                 return response.choices[0].message.content
@@ -420,86 +448,46 @@ def visualize_aggregation_example(
     print("=" * 60 + "\n")
 
 
-# --------------------- evaluation (LLM grader) ---------------------
-
-GRADER_MODEL = "gpt-5.2"
-
-GRADER_PROMPT = """
-You are grading an attempted answer to a science olympiad problem. You will be given the problem, attempted answer, and reference answer. Evaluate the solution against the provided reference solution, ensuring it is complete and matches the reference solution. Pay close attention to detail and grade it strictly, but fairly.
-The reference answer is either a single number or expression in latex formatting, a chemical formula, a compound name, or a phrase referring to a specific name, entity, or method. Mark the attempted answer as correct if it fully matches the reference answer or is otherwise equivalent (e.g., an equivalent algebraic expression, a numerical number within 1 decimal place rounding of the reference answer (e.g., 6.69 ≈ 6.7), an equivalent name for a compound/formula, equivalent when accounting for units, etc.). Mark it as incorrect if it is not equivalent to the reference answer.
-***
-The problem: {problem}
-***
-The reference answer: {ground_truth}
-***
-The attempted answer: {prediction}
-***
-First, think step-by-step about whether the attempted answer matches the reference answer. If the attempted answer is correct, write ”VERDICT: CORRECT” in the last line of your response, with no other text or formatting. If it is incorrect, write ”VERDICT: INCORRECT”.
-"""
-
-
-def score_with_llm(grader_client, problem: str, prediction: str, ground_truth: str) -> tuple[float, str]:
-    """Score a prediction using GPT 5.2 as grader.
-
-    Returns:
-        (score, reasoning) tuple where:
-        - score is 1.0 (correct), 0.0 (incorrect), or -1.0 (grading failed)
-        - reasoning is the grader's full response text, or empty string if grading failed
-    """
-    prompt = GRADER_PROMPT.format(
-        problem=problem,
-        ground_truth=ground_truth,
-        prediction=prediction
-    )
-
-    for attempt in range(3):
-        try:
-            response = grader_client.responses.create(
-                model=GRADER_MODEL,
-                input=prompt,
-                reasoning={"effort": "high"}
-            )
-            reasoning = response.output_text.strip()
-            # Parse "VERDICT: CORRECT" or "VERDICT: INCORRECT"
-            if "VERDICT: CORRECT" in reasoning.upper():
-                return (1.0, reasoning)
-            elif "VERDICT: INCORRECT" in reasoning.upper():
-                return (0.0, reasoning)
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-            else:
-                print(f"Grading failed: {e}, returning -1.0")
-                return (-1.0, "")
-    return (-1.0, "")
-
-
 def evaluate_k_answers_frontierscience(
     grader_client,
     problem: str,
     k_answers: List[str],
     gt: str,
-    max_workers: int = 32
+    max_workers: int = 32,
+    grader_mode: str = "gpt",
+    gemini_client=None,
 ) -> Dict[str, Any]:
     """Evaluate multiple candidates using LLM grader.
 
     IMPORTANT: Extracts answers first, then grades only the extracted answers.
     The grader should never see the full reasoning chain.
+
+    Args:
+        grader_mode: "gpt" (default), "gemini", or "debate"
+        gemini_client: Required if grader_mode is "gemini" or "debate"
     """
     # Extract answers from full responses
     extracted = [extract_frontierscience_answer(a) or "" for a in k_answers]
 
+    # Select scoring function based on grader mode
+    if grader_mode == "gemini":
+        score_fn = lambda problem, pred, gt: score_with_gemini(gemini_client, problem, pred, gt)
+    elif grader_mode == "debate":
+        score_fn = lambda problem, pred, gt: score_with_debate(grader_client, gemini_client, problem, pred, gt)
+    else:
+        score_fn = lambda problem, pred, gt: score_with_llm(grader_client, problem, pred, gt)
+
     # Grade only the extracted answers (parallel)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(score_with_llm, grader_client, problem, e, gt) for e in extracted]
+        futures = [executor.submit(score_fn, problem, e, gt) for e in extracted]
         results = [f.result() for f in futures]
 
     # Unpack (score, reasoning) tuples
     scores = [r[0] for r in results]
     grader_reasonings = [r[1] for r in results]
 
-    # For metrics, exclude grading failures (-1.0)
-    valid_scores = [s for s in scores if s >= 0.0]
+    # For metrics, exclude grading failures (None)
+    valid_scores = [s for s in scores if s is not None]
     mean_acc = float(sum(valid_scores) / max(1, len(valid_scores))) if valid_scores else 0.0
     pass_at_k = float(1.0 if any(s >= 1.0 for s in valid_scores) else 0.0)
 
@@ -507,7 +495,7 @@ def evaluate_k_answers_frontierscience(
     majority_vote = 1.0 if valid_scores and (sum(valid_scores) / len(valid_scores)) >= 0.5 else 0.0
 
     return {
-        "pred_accuracies": [float(s) for s in scores],
+        "pred_accuracies": [float(s) if s is not None else None for s in scores],
         "grader_reasonings": grader_reasonings,
         "extracted_answers": extracted,
         "mean_acc": mean_acc,
@@ -614,7 +602,7 @@ def run(
     population: int,
     data: List[Dict],
     task: str,
-    max_tokens: int,
+    thinking_budget: int,
     temperature: float,
     max_workers: int = 32,
     logger: Optional[VerboseLogger] = None,
@@ -622,6 +610,8 @@ def run(
     output_dir: Optional[str] = None,
     loops: int = 1,
     rollouts_path: Optional[str] = None,
+    grader_mode: str = "gpt",
+    gemini_client=None,
 ) -> tuple:
     """Run one loop of generation + evaluation."""
     if logger:
@@ -656,7 +646,7 @@ def run(
 
     def call_one(req_tuple):
         _, prompt = req_tuple
-        return call_api(client, client_type, model, prompt, max_tokens, temperature)
+        return call_api(client, client_type, model, prompt, temperature, thinking_budget)
 
     all_responses = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -715,7 +705,8 @@ def run(
         prev_rollout_uids = problem.get('prev_rollout_uids', [])
 
         perf_metric = evaluate_k_answers_frontierscience(
-            grader_client, orig_prompt, responses[:], gt
+            grader_client, orig_prompt, responses[:], gt,
+            grader_mode=grader_mode, gemini_client=gemini_client,
         )
         # Save extracted answers and scores for debugging/reproducibility
         problem['extracted_answers'] = perf_metric['extracted_answers']
@@ -786,14 +777,16 @@ def loop(
     domain: Optional[str],
     sample_range: Optional[str],
     output_dir: str,
-    max_tokens: int,
+    thinking_budget: int,
     temperature: float,
     openai_api_key: Optional[str],
     anthropic_api_key: Optional[str],
     livai_api_key: Optional[str],
+    google_api_key: Optional[str],
     max_workers: int,
     run_name: str = "",
     verbose: bool = False,
+    grader_mode: str = "gpt",
 ):
     # Setup verbose logger
     logger = VerboseLogger(enabled=verbose)
@@ -804,11 +797,25 @@ def loop(
     client, client_type = get_api_client(model_name, openai_api_key, anthropic_api_key, livai_api_key)
     grader_client = get_grader_client(openai_api_key)
 
+    # Setup Gemini client if needed
+    gemini_client = None
+    if grader_mode in ("gemini", "debate"):
+        if not google_api_key:
+            print("ERROR: --grader gemini/debate requires GOOGLE_API_KEY in api_key.txt or environment")
+            sys.exit(1)
+        gemini_client = get_gemini_grader_client(google_api_key)
+
     if client_type == "livai":
         print(f"Using model: {model_name} via LIVAI API")
     else:
         print(f"Using model: {model_name} ({client_type})")
-    print(f"Using {GRADER_MODEL} as grader (OpenAI)")
+
+    if grader_mode == "gemini":
+        print(f"Using {GEMINI_GRADER_MODEL} as grader (Gemini)")
+    elif grader_mode == "debate":
+        print(f"Using debate grader: {GRADER_MODEL} (GPT) + {GEMINI_GRADER_MODEL} (Gemini)")
+    else:
+        print(f"Using {GRADER_MODEL} as grader (OpenAI)")
 
     # Load dataset
     print("Loading FrontierScience dataset...")
@@ -859,7 +866,7 @@ def loop(
             population=population,
             data=data,
             task=task,
-            max_tokens=max_tokens,
+            thinking_budget=thinking_budget,
             temperature=temperature,
             max_workers=max_workers,
             logger=logger,
@@ -867,6 +874,8 @@ def loop(
             output_dir=output_dir,
             loops=loops,
             rollouts_path=rollouts_path,
+            grader_mode=grader_mode,
+            gemini_client=gemini_client,
         )
 
         print(f"Loop {loop_idx} metrics: {metrics}")
@@ -882,15 +891,21 @@ def main():
     ap.add_argument("--k", type=int, default=4, help="Candidates to sample for aggregation")
     ap.add_argument("--population", type=int, default=16, help="Candidates per problem per loop")
     ap.add_argument("--loops", type=int, default=10, help="Number of RSA loops")
-    ap.add_argument("--max-tokens", type=int, default=16384, help="Max tokens per response")
+    ap.add_argument("--thinking-budget", type=int, default=16384,
+                    help="Thinking token budget for older Anthropic models (sonnet/opus < 4.6). "
+                         "Ignored for OpenAI/Gemini and Claude 4.6+ (which use adaptive thinking).")
     ap.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     ap.add_argument("--run-name", type=str, default="", help="Optional run name suffix for output files")
-    ap.add_argument("--max-workers", type=int, default=4, help="Max parallel API calls")
+    ap.add_argument("--max-workers", type=int, default=32, help="Max parallel API calls")
     ap.add_argument("--verbose", "-v", action='store_true', help="Show live extracted answers and scores (requires 'rich')")
+
+    ap.add_argument("--grader", choices=["gpt", "gemini", "debate"], default="gpt",
+                    help="Grader mode: 'gpt' (GPT 5.2), 'gemini' (Gemini 3 Flash), 'debate' (both, GPT breaks ties)")
 
     # API keys (default to env vars via api_key.txt)
     ap.add_argument("--openai-api-key", help="OpenAI API key")
     ap.add_argument("--anthropic-api-key", help="Anthropic API key")
+    ap.add_argument("--google-api-key", help="Google API key (for Gemini grader)")
     args = ap.parse_args()
 
     # Load API keys: CLI args > api_key.txt > env vars
@@ -898,6 +913,7 @@ def main():
     openai_key = args.openai_api_key or file_keys.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
     anthropic_key = args.anthropic_api_key or file_keys.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
     livai_key = file_keys.get("LIVAI_API_KEY") or os.environ.get("LIVAI_API_KEY")
+    google_key = args.google_api_key or file_keys.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
     loop(
         model_name=args.model,
@@ -907,14 +923,16 @@ def main():
         domain=args.domain,
         sample_range=args.n_samples,
         output_dir=os.path.join(args.output, args.model.replace('/', '_')),
-        max_tokens=args.max_tokens,
+        thinking_budget=args.thinking_budget,
         temperature=args.temperature,
         openai_api_key=openai_key,
         anthropic_api_key=anthropic_key,
         livai_api_key=livai_key,
+        google_api_key=google_key,
         max_workers=args.max_workers,
         run_name=args.run_name,
         verbose=args.verbose,
+        grader_mode=args.grader,
     )
 
 

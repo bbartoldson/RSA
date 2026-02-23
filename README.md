@@ -73,6 +73,32 @@ python eval_frontierscience.py \
 
 Results are saved to `./eval/frontierscience/<run_id>.json` with `question_ids` for reproducibility.
 
+### Re-grading Rollouts
+
+After running `eval_frontierscience.py`, you can re-grade the rollout JSONL files with different judges using `judge.py` (single judge) or `debate.py` (GPT + Gemini debate).
+
+**Single judge** (GPT or Gemini):
+```bash
+# Grade loop 9 rollouts with Gemini
+python judge.py --rollouts-path eval/frontierscience/<model>/rollouts_k_4_N_16.jsonl --judge gemini
+
+# Grade loop 9 rollouts with GPT
+python judge.py --rollouts-path eval/frontierscience/<model>/rollouts_k_4_N_16.jsonl --judge gpt
+
+# Grade all loops
+python judge.py --rollouts-path eval/frontierscience/<model>/rollouts_k_4_N_16.jsonl --judge gemini --loop -1
+```
+
+**Debate** (GPT 5.2 + Gemini, GPT breaks ties):
+```bash
+python debate.py --rollouts-path eval/frontierscience/<model>/rollouts_k_4_N_16.jsonl
+
+# With 2-round debate (adds Gemini rebuttal + GPT final decision)
+python debate.py --rollouts-path eval/frontierscience/<model>/rollouts_k_4_N_16.jsonl --debate-rounds 2
+```
+
+Both tools skip already-graded records, write results atomically, and print an accuracy summary. Columns added: `{judge}_grade`/`{judge}_reasoning` for `judge.py`, `debate_grade`/`debate_reasoning` for `debate.py`.
+
 ## Aggregation-aware RL training with verl
 
 First install verl from `https://github.com/volcengine/verl.git`.
