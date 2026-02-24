@@ -1,0 +1,15 @@
+[project]
+name = "rsa-eval"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.83.0",
+    "datasets>=4.5.0",
+    "google-genai>=1.64.0",
+    "numpy>=2.4.2",
+    "openai>=2.23.0",
+    "rich>=14.3.3",
+    "tqdm>=4.67.3",
+]

@@ -237,7 +237,7 @@ def _is_new_claude(model: str) -> bool:
 
 
 
-def call_api(client, client_type: str, model: str, prompt: str, temperature: float, thinking_budget: int = 16384, retries: int = 3) -> str:
+def call_api(client, client_type: str, model: str, prompt: str, temperature: float, thinking_budget: int = 16384, adaptive_thinking: bool = False, retries: int = 3) -> str:
     """Call API and return response text with retry logic.
 
     Supports three client types:
@@ -246,8 +246,8 @@ def call_api(client, client_type: str, model: str, prompt: str, temperature: flo
     - "livai": LIVAI API (OpenAI-compatible endpoint for Claude models)
 
     For Anthropic models:
-    - Claude 4.6+: adaptive thinking with high effort
-    - Older Claude: extended thinking with explicit budget (thinking_budget)
+    - adaptive_thinking=True: adaptive thinking with high effort (Claude 4.6+ style)
+    - adaptive_thinking=False (default): extended thinking with explicit budget (thinking_budget)
 
     For OpenAI / LIVAI: reasoning_effort="high", no max_completion_tokens cap.
 
@@ -260,11 +260,11 @@ def call_api(client, client_type: str, model: str, prompt: str, temperature: flo
             if client_type == "anthropic":
                 kwargs = {
                     "model": model,
-                    "max_tokens": 64000,
+                    "max_tokens": thinking_budget+9999,
                     "temperature": temperature,
                     "messages": [{"role": "user", "content": prompt}],
                 }
-                if _is_new_claude(model):
+                if adaptive_thinking:
                     kwargs["thinking"] = {"type": "adaptive"}
                     kwargs["output_config"] = {"effort": "high"}
                 else:
@@ -612,6 +612,7 @@ def run(
     rollouts_path: Optional[str] = None,
     grader_mode: str = "gpt",
     gemini_client=None,
+    adaptive_thinking: bool = False,
 ) -> tuple:
     """Run one loop of generation + evaluation."""
     if logger:
@@ -646,7 +647,7 @@ def run(
 
     def call_one(req_tuple):
         _, prompt = req_tuple
-        return call_api(client, client_type, model, prompt, temperature, thinking_budget)
+        return call_api(client, client_type, model, prompt, temperature, thinking_budget, adaptive_thinking)
 
     all_responses = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -787,6 +788,7 @@ def loop(
     run_name: str = "",
     verbose: bool = False,
     grader_mode: str = "gpt",
+    adaptive_thinking: bool = False,
 ):
     # Setup verbose logger
     logger = VerboseLogger(enabled=verbose)
@@ -876,6 +878,7 @@ def loop(
             rollouts_path=rollouts_path,
             grader_mode=grader_mode,
             gemini_client=gemini_client,
+            adaptive_thinking=adaptive_thinking,
         )
 
         print(f"Loop {loop_idx} metrics: {metrics}")
@@ -891,9 +894,12 @@ def main():
     ap.add_argument("--k", type=int, default=4, help="Candidates to sample for aggregation")
     ap.add_argument("--population", type=int, default=16, help="Candidates per problem per loop")
     ap.add_argument("--loops", type=int, default=10, help="Number of RSA loops")
-    ap.add_argument("--thinking-budget", type=int, default=16384,
-                    help="Thinking token budget for older Anthropic models (sonnet/opus < 4.6). "
-                         "Ignored for OpenAI/Gemini and Claude 4.6+ (which use adaptive thinking).")
+    ap.add_argument("--thinking-budget", type=int, default=64000,
+                    help="Thinking token budget for Anthropic models (used with old-style extended thinking). "
+                         "Ignored for OpenAI/Gemini and when --adaptive-thinking is set.")
+    ap.add_argument("--adaptive-thinking", action='store_true',
+                    help="Use adaptive thinking (new style) instead of old-style extended thinking with explicit budget. "
+                         "Default is old-style thinking.")
     ap.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     ap.add_argument("--run-name", type=str, default="", help="Optional run name suffix for output files")
     ap.add_argument("--max-workers", type=int, default=32, help="Max parallel API calls")
@@ -915,6 +921,11 @@ def main():
     livai_key = file_keys.get("LIVAI_API_KEY") or os.environ.get("LIVAI_API_KEY")
     google_key = args.google_api_key or file_keys.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
+    # Build output dir with thinking type and budget info
+    thinking_label = "thinking-adaptive" if args.adaptive_thinking else f"thinking-old_tb-{args.thinking_budget}"
+    model_dir = f"{args.model.replace('/', '_')}_{thinking_label}"
+    output_dir = os.path.join(args.output, model_dir)
+
     loop(
         model_name=args.model,
         loops=args.loops,
@@ -922,7 +933,7 @@ def main():
         population=args.population,
         domain=args.domain,
         sample_range=args.n_samples,
-        output_dir=os.path.join(args.output, args.model.replace('/', '_')),
+        output_dir=output_dir,
         thinking_budget=args.thinking_budget,
         temperature=args.temperature,
         openai_api_key=openai_key,
@@ -933,6 +944,7 @@ def main():
         run_name=args.run_name,
         verbose=args.verbose,
         grader_mode=args.grader,
+        adaptive_thinking=args.adaptive_thinking,
     )
 
 
